@@ -66,7 +66,7 @@ public interface HdPluginConfig extends Config
 		keyName = "drawDistance",
 		name = "Draw Distance",
 		description = "Draw distance",
-		position = 1,
+		position = 2,
 		section = generalSettings
 	)
 	default int drawDistance()
@@ -186,7 +186,18 @@ public interface HdPluginConfig extends Config
 		return LevelOfDetail.MEDIUM;
 	}
 
-
+	@ConfigItem(
+		keyName = "useComputeShaders",
+		name = "Compute Shaders",
+		description = "Offloads face sorting to GPU, enabling extended draw distance. Requires plugin restart.",
+		warning = "This feature requires OpenGL 4.3 to use. Please check that your GPU supports this.\nRestart the plugin for changes to take effect.",
+		position = 11,
+		section = generalSettings
+	)
+	default boolean useComputeShaders()
+	{
+		return true;
+	}
 
 	/*====== Lighting settings ======*/
 

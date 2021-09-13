@@ -162,6 +162,9 @@ public class HdPlugin extends Plugin implements DrawCallbacks
 	private Client client;
 
 	@Inject
+	private OpenCLManager openCLManager;
+
+	@Inject
 	private ClientThread clientThread;
 
 	@Inject
@@ -187,6 +190,15 @@ public class HdPlugin extends Plugin implements DrawCallbacks
 
 	@Inject
 	private ProceduralGenerator proceduralGenerator;
+
+	enum ComputeMode
+	{
+		NONE,
+		OPENGL,
+		OPENCL
+	}
+
+	private ComputeMode computeMode = ComputeMode.NONE;
 
 	private Canvas canvas;
 	private JAWTWindow jawtWindow;
@@ -420,6 +432,10 @@ public class HdPlugin extends Plugin implements DrawCallbacks
 					return false;
 				}
 
+				computeMode = config.useComputeShaders()
+					? (OSType.getOSType() == OSType.MacOS ? ComputeMode.OPENCL : ComputeMode.OPENGL)
+					: ComputeMode.NONE;
+
 				canvas.setIgnoreRepaint(true);
 
 				vertexBuffer = new GpuIntBuffer();
@@ -574,6 +590,8 @@ public class HdPlugin extends Plugin implements DrawCallbacks
 
 			invokeOnMainThread(() ->
 			{
+				openCLManager.cleanup();
+
 				if (gl != null)
 				{
 					if (textureArrayId != -1)
@@ -665,10 +683,18 @@ public class HdPlugin extends Plugin implements DrawCallbacks
 
 		glProgram = PROGRAM.compile(gl, template);
 		glUiProgram = UI_PROGRAM.compile(gl, template);
-		glShadowProgram = SHADOW_PROGRAM.compile(gl, template);
-		glComputeProgram = COMPUTE_PROGRAM.compile(gl, template);
-		glSmallComputeProgram = SMALL_COMPUTE_PROGRAM.compile(gl, template);
-		glUnorderedComputeProgram = UNORDERED_COMPUTE_PROGRAM.compile(gl, template);
+
+		if (computeMode == ComputeMode.OPENGL)
+		{
+			glShadowProgram = SHADOW_PROGRAM.compile(gl, template);
+			glComputeProgram = COMPUTE_PROGRAM.compile(gl, template);
+			glSmallComputeProgram = SMALL_COMPUTE_PROGRAM.compile(gl, template);
+			glUnorderedComputeProgram = UNORDERED_COMPUTE_PROGRAM.compile(gl, template);
+		}
+		else if (computeMode == ComputeMode.OPENCL)
+		{
+			openCLManager.init(gl);
+		}
 
 		initUniforms();
 
@@ -1118,6 +1144,20 @@ public class HdPlugin extends Plugin implements DrawCallbacks
 
 	private void postDraw()
 	{
+		if (computeMode == ComputeMode.NONE)
+		{
+			// Upload buffers
+			vertexBuffer.flip();
+			uvBuffer.flip();
+			
+			IntBuffer vertexBuffer = this.vertexBuffer.getBuffer();
+			FloatBuffer uvBuffer = this.uvBuffer.getBuffer();
+
+			updateBuffer(tmpVertexBuffer, GL_ARRAY_BUFFER, vertexBuffer.limit() * Integer.BYTES, vertexBuffer, GL_DYNAMIC_DRAW, 0L);
+			updateBuffer(tmpUvBuffer, GL_ARRAY_BUFFER, uvBuffer.limit() * Float.BYTES, uvBuffer, GL_DYNAMIC_DRAW, 0L);
+			return;
+		}
+
 		// Upload buffers
 		vertexBuffer.flip();
 		uvBuffer.flip();
@@ -1162,6 +1202,23 @@ public class HdPlugin extends Plugin implements DrawCallbacks
 			null,
 			GL_STREAM_DRAW,
 			CL_MEM_WRITE_ONLY);
+
+		if (computeMode == ComputeMode.OPENCL)
+		{
+			// The docs for clEnqueueAcquireGLObjects say all pending GL operations must be completed before calling
+			// clEnqueueAcquireGLObjects, and recommends calling glFinish() as the only portable way to do that.
+			// However no issues have been observed from not calling it, and so will leave disabled for now.
+			// gl.glFinish();
+
+			openCLManager.compute(
+				unorderedModels, smallModels, largeModels,
+				sceneVertexBuffer, sceneUvBuffer,
+				tmpVertexBuffer, tmpUvBuffer,
+				tmpModelBufferUnordered, tmpModelBufferSmall, tmpModelBufferLarge,
+				tmpOutBuffer, tmpOutUvBuffer,
+				uniformBuffer);
+			return;
+		}
 
 		/*
 		 * Compute is split into three separate programs: 'unordered', 'small', and 'large'
@@ -1226,7 +1283,17 @@ public class HdPlugin extends Plugin implements DrawCallbacks
 							   SceneTilePaint paint, int tileZ, int tileX, int tileY,
 							   int zoom, int centerX, int centerY)
 	{
-		if (paint.getBufferLen() > 0)
+		if (computeMode == ComputeMode.NONE)
+		{
+			targetBufferOffset += sceneUploader.upload(paint,
+				tileZ, tileX, tileY,
+				vertexBuffer, uvBuffer, normalBuffer,
+				Perspective.LOCAL_TILE_SIZE * tileX,
+				Perspective.LOCAL_TILE_SIZE * tileY,
+				true
+			);
+		}
+		else if (paint.getBufferLen() > 0)
 		{
 			final int localX = tileX * Perspective.LOCAL_TILE_SIZE;
 			final int localY = 0;
@@ -1282,7 +1349,14 @@ public class HdPlugin extends Plugin implements DrawCallbacks
 							   SceneTileModel model, int tileZ, int tileX, int tileY,
 							   int zoom, int centerX, int centerY)
 	{
-		if (model.getBufferLen() > 0)
+		if (computeMode == ComputeMode.NONE)
+		{
+			targetBufferOffset += sceneUploader.upload(model,
+				tileX, tileY,
+				vertexBuffer, uvBuffer, normalBuffer,
+				tileX << Perspective.LOCAL_COORD_BITS, tileY << Perspective.LOCAL_COORD_BITS, true);
+		}
+		else if (model.getBufferLen() > 0)
 		{
 			final int localX = tileX * Perspective.LOCAL_TILE_SIZE;
 			final int localY = 0;
@@ -1764,6 +1838,30 @@ public class HdPlugin extends Plugin implements DrawCallbacks
 			// Draw buffers
 			gl.glBindVertexArray(vaoHandle);
 
+			if (computeMode != ComputeMode.NONE)
+			{
+				if (computeMode == ComputeMode.OPENGL)
+				{
+					// Before reading the SSBOs written to from postDrawScene() we must insert a barrier
+					gl.glMemoryBarrier(gl.GL_SHADER_STORAGE_BARRIER_BIT);
+				}
+				else
+				{
+					// Wait for the command queue to finish, so that we know the compute is done
+					openCLManager.finish();
+				}
+
+				// Draw using the output buffer of the compute
+				vertexBuffer = tmpOutBuffer.glBufferId;
+				uvBuffer = tmpOutUvBuffer.glBufferId;
+			}
+			else
+			{
+				// Only use the temporary buffers, which will contain the full scene
+				vertexBuffer = tmpVertexBuffer.glBufferId;
+				uvBuffer = tmpUvBuffer.glBufferId;
+			}
+
 			gl.glEnableVertexAttribArray(0);
 			gl.glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
 			gl.glVertexAttribIPointer(0, 4, gl.GL_INT, 0, 0);
@@ -1964,7 +2062,7 @@ public class HdPlugin extends Plugin implements DrawCallbacks
 			lightManager.reset();
 		}
 
-		if (gameStateChanged.getGameState() != GameState.LOGGED_IN)
+		if (computeMode == ComputeMode.NONE || gameStateChanged.getGameState() != GameState.LOGGED_IN)
 		{
 			return;
 		}
